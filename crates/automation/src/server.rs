@@ -1,8 +1,10 @@
 //! MCP server: JSON-RPC 2.0, one message per line (the MCP stdio transport). Implements
 //! tools and JSON resources. The stdio loop handles progress and cancellation for long renders.
 
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
@@ -157,6 +159,92 @@ impl McpServer {
         self.serve(std::io::BufReader::new(std::io::stdin()), std::io::stdout().lock())
     }
 
+    /// Serve the same JSON-RPC session over loopback HTTP.
+    ///
+    /// `addr` is `127.0.0.1:8765`, `localhost:8765` or `:8765` (which binds `127.0.0.1`).
+    /// Anything that is not a loopback address is refused. `POST /mcp` (and `POST /`) carries
+    /// one JSON-RPC message and returns one JSON response. `GET /health` is a readiness check.
+    /// `POST /shutdown` stops the accept loop. This transport is sequential: a render blocks
+    /// the next request until it finishes. Progress notifications stay on the stdio transport.
+    pub fn serve_http(&mut self, addr: &str) -> std::io::Result<()> {
+        let sock = loopback_addr(addr)?;
+        let listener = TcpListener::bind(sock)?;
+        let bound = listener.local_addr()?;
+        eprintln!("effectcraft MCP http://{bound}/mcp");
+        self.serve_http_listener(listener)
+    }
+
+    /// Accept HTTP connections on an already-bound loopback listener until `POST /shutdown`.
+    pub fn serve_http_listener(&mut self, listener: TcpListener) -> std::io::Result<()> {
+        let served = (|| {
+            for conn in listener.incoming() {
+                let mut stream = conn?;
+                stream.set_read_timeout(Some(Duration::from_secs(60)))?;
+                stream.set_write_timeout(Some(Duration::from_secs(60)))?;
+                match self.http_one(&mut stream) {
+                    Ok(true) => break,
+                    Ok(false) => {}
+                    Err(e) => {
+                        let _ = writeln!(std::io::stderr(), "mcp http: {e}");
+                    }
+                }
+            }
+            Ok(())
+        })();
+        match (served, self.checkpoint(true)) {
+            (r, Ok(())) => r,
+            (Ok(()), Err(e)) => Err(e),
+            (Err(transport), Err(save)) => Err(std::io::Error::other(format!("{transport}; {save}"))),
+        }
+    }
+
+    /// Handle one HTTP request. `Ok(true)` asks the accept loop to stop.
+    fn http_one(&mut self, stream: &mut TcpStream) -> std::io::Result<bool> {
+        let req = match read_http(stream) {
+            Ok(req) => req,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
+            Err(e) => {
+                let body = error(Value::Null, PARSE_ERROR, &e.to_string()).to_string();
+                write_http(stream, 400, "Bad Request", "application/json", body.as_bytes())?;
+                return Ok(false);
+            }
+        };
+        if !origin_allowed(&req.headers) {
+            write_http(stream, 403, "Forbidden", "application/json", br#"{"error":"origin is not loopback"}"#)?;
+            return Ok(false);
+        }
+        let path = req.path.split('?').next().unwrap_or("/");
+        if req.method == "OPTIONS" {
+            write_http(stream, 204, "No Content", "text/plain", b"")?;
+            return Ok(false);
+        }
+        if req.method == "GET" && (path == "/" || path == "/health") {
+            write_http(stream, 200, "OK", "application/json", br#"{"ok":true,"transport":"http","name":"effectcraft"}"#)?;
+            return Ok(false);
+        }
+        if req.method == "POST" && path == "/shutdown" {
+            write_http(stream, 200, "OK", "application/json", br#"{"ok":true,"shutdown":true}"#)?;
+            return Ok(true);
+        }
+        if req.method != "POST" || (path != "/mcp" && path != "/") {
+            write_http(stream, 404, "Not Found", "application/json", br#"{"error":"use POST /mcp"}"#)?;
+            return Ok(false);
+        }
+        let msg = match serde_json::from_slice::<Value>(&req.body) {
+            Ok(msg) => msg,
+            Err(e) => {
+                let body = error(Value::Null, PARSE_ERROR, &format!("parse error: {e}")).to_string();
+                write_http(stream, 400, "Bad Request", "application/json", body.as_bytes())?;
+                return Ok(false);
+            }
+        };
+        match self.handle(&msg) {
+            Some(reply) => write_http(stream, 200, "OK", "application/json", reply.to_string().as_bytes())?,
+            None => write_http(stream, 202, "Accepted", "application/json", b"{}")?,
+        }
+        Ok(false)
+    }
+
     fn request(&mut self, method: &str, params: &Value) -> Result<Value, (i64, String)> {
         match method {
             "initialize" => {
@@ -305,4 +393,99 @@ pub(crate) fn modern_result_fields(method: &str, params: &Value, result: &mut Va
 
 fn error(id: Value, code: i64, message: &str) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
+}
+
+/// `127.0.0.1:8765`, `[::1]:8765`, `localhost:8765` or `:8765`. Other hosts are refused.
+pub fn loopback_addr(addr: &str) -> std::io::Result<SocketAddr> {
+    let addr = addr.trim();
+    if addr.is_empty() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "--http needs HOST:PORT or :PORT"));
+    }
+    let formatted = if let Some(port) = addr.strip_prefix(':') {
+        format!("127.0.0.1:{port}")
+    } else if let Some(rest) = addr.strip_prefix("localhost:") {
+        format!("127.0.0.1:{rest}")
+    } else if addr == "localhost" {
+        "127.0.0.1:8765".to_string()
+    } else {
+        addr.to_string()
+    };
+    let sock: SocketAddr = formatted.parse().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("--http: {formatted}: {e}")))?;
+    if !sock.ip().is_loopback() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("--http refuses non-loopback address {sock}; bind 127.0.0.1 or localhost")));
+    }
+    Ok(sock)
+}
+
+struct HttpRequest {
+    method: String,
+    path: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+fn read_http(stream: &mut impl Read) -> std::io::Result<HttpRequest> {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 8192];
+    let split = loop {
+        if buf.len() > 1024 * 1024 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "http headers too large"));
+        }
+        let n = stream.read(&mut tmp)?;
+        if n == 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "client closed"));
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break i;
+        }
+    };
+    let head = String::from_utf8_lossy(&buf[..split]);
+    let mut lines = head.split("\r\n");
+    let request_line = lines.next().unwrap_or("");
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("").to_string();
+    let path = parts.next().unwrap_or("/").to_string();
+    let mut headers = Vec::new();
+    for line in lines {
+        if let Some((name, value)) = line.split_once(':') {
+            headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
+        }
+    }
+    let len = headers.iter().find(|(k, _)| k == "content-length").and_then(|(_, v)| v.parse::<usize>().ok()).unwrap_or(0);
+    if len > 16 * 1024 * 1024 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "http body too large"));
+    }
+    let mut body = buf[split + 4..].to_vec();
+    while body.len() < len {
+        let n = stream.read(&mut tmp)?;
+        if n == 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "short http body"));
+        }
+        body.extend_from_slice(&tmp[..n]);
+    }
+    body.truncate(len);
+    Ok(HttpRequest { method, path, headers, body })
+}
+
+fn origin_allowed(headers: &[(String, String)]) -> bool {
+    let Some((_, origin)) = headers.iter().find(|(k, _)| k == "origin") else {
+        return true;
+    };
+    let origin = origin.trim().trim_end_matches('/');
+    origin.starts_with("http://127.0.0.1")
+        || origin.starts_with("http://localhost")
+        || origin.starts_with("http://[::1]")
+        || origin.starts_with("https://127.0.0.1")
+        || origin.starts_with("https://localhost")
+}
+
+fn write_http(stream: &mut impl Write, status: u16, reason: &str, content_type: &str, body: &[u8]) -> std::io::Result<()> {
+    let head = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\nAccess-Control-Allow-Origin: http://127.0.0.1\r\nAccess-Control-Allow-Headers: content-type\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(body)?;
+    stream.flush()
 }

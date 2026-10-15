@@ -24,7 +24,7 @@
 //! effectcraft-cli bench --ops [--small] [--layers N] [--comps N] [--footage N]   everyday-operation timings
 //!     on a large generated project (open, save, auto-save, undo/redo, timeline, Project panel)
 //! effectcraft-cli script FILE.jsx [F.ecproj] | --eval CODE    run an After Effects-style script
-//! effectcraft-cli mcp [--autosave | --bridge PORT]            MCP server on stdio
+//! effectcraft-cli mcp [--autosave | --bridge PORT | --http ADDR]  MCP server (stdio, or loopback HTTP)
 //!
 //! Project:  --project F.ecproj (or a positional *.ecproj) | --demo | --empty   (default: demo; mcp: empty)
 //! Saving:   --save (back to --project) | --save-as F.ecproj
@@ -116,7 +116,11 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
   script FILE.jsx [F.ecproj] | --eval CODE run JavaScript with the After Effects-style object model
                                            (app.project, comps, layers, properties…); prints writeLn
                                            output and the result; errors exit 1 with file:line:col
-  mcp [--autosave | --bridge PORT]         MCP server (JSON-RPC over stdio); --autosave preserves unsaved headless work
+  mcp [--autosave | --bridge PORT | --http ADDR]
+                                           MCP server. Default transport is JSON-RPC over stdio.
+                                           --http 127.0.0.1:8765 (or :8765) serves the same session
+                                           on loopback HTTP (POST /mcp). Non-loopback binds are refused.
+                                           --autosave preserves unsaved headless work
       [--automation-read-root DIR] [--automation-write-root DIR]
                                            confine the agent's file access: reads under a read or write root,
                                            writes under a write root (each repeatable); scripts are refused
@@ -169,6 +173,7 @@ const VALUED: &[&str] = &[
     // mcp
     "--automation-read-root",
     "--automation-write-root",
+    "--http",
 ];
 
 /// Options without a value. Any other `--option` is a usage error.
@@ -605,6 +610,9 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
             if args.flag("--autosave") && args.opt("--bridge").is_some() {
                 return usage_err("--autosave is for headless MCP; the bridged app owns its auto-saves");
             }
+            if args.opt("--http").is_some() && args.opt("--bridge").is_some() {
+                return usage_err("--http serves a headless session; it cannot be combined with --bridge");
+            }
             let mut b = backend(args, false)?;
             let (read, write) = (args.opts("--automation-read-root"), args.opts("--automation-write-root"));
             if !read.is_empty() || !write.is_empty() {
@@ -620,7 +628,8 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
                 server
             };
             // A client that closes its end of stdout has ended the session.
-            match server.serve_stdio() {
+            let served = if let Some(addr) = args.opt("--http") { server.serve_http(addr) } else { server.serve_stdio() };
+            match served {
                 Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => return Err(e.to_string().into()),
                 _ => {}
             }

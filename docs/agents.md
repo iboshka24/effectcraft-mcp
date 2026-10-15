@@ -77,6 +77,9 @@ claude mcp add effectcraft -- effectcraft-cli mcp
 The server speaks JSON-RPC 2.0 over stdio, one message per line, and supports MCP protocol versions
 2025-06-18, 2025-03-26 and 2024-11-05 (`initialize`, `ping`, `tools/list`, `tools/call`).
 
+The same session is available on loopback HTTP: `effectcraft-cli mcp --http 127.0.0.1:8765`
+(`POST /mcp`, `GET /health`). Non-loopback addresses are refused. See [mcp.md](mcp.md).
+
 ### Keeping headless work across restarts
 
 Start `effectcraft-cli mcp --autosave` (MCP args `["mcp", "--autosave"]`) to preserve

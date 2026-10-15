@@ -1,7 +1,18 @@
 # MCP conventions
 
-Run `effectcraft-cli mcp` for a headless session, or `effectcraft-cli mcp --bridge 9877`
+Run `effectcraft-cli mcp` for a headless session on stdio, `effectcraft-cli mcp --http 127.0.0.1:8765`
+for the same session over loopback HTTP, or `effectcraft-cli mcp --bridge 9877`
 to use the desktop app's control channel. Existing ports are unchanged.
+
+## Loopback HTTP
+
+`--http ADDR` binds only a loopback address (`127.0.0.1:8765`, `localhost:8765`, or `:8765`).
+A non-loopback host is refused before the socket opens. `POST /mcp` (and `POST /`) sends one
+JSON-RPC message and receives one JSON response — the same methods as stdio (`initialize`,
+`tools/list`, `tools/call`, `resources/read`). `GET /health` returns `{"ok":true}`.
+`POST /shutdown` stops the process. Requests that send an `Origin` other than loopback are
+rejected. The HTTP server handles one request at a time; progress notifications and
+cancellation of a render stay on the stdio transport.
 
 ## Confining file access
 
