@@ -77,6 +77,9 @@ claude mcp add effectcraft -- effectcraft-cli mcp
 The server speaks JSON-RPC 2.0 over stdio, one message per line, and supports MCP protocol versions
 2025-06-18, 2025-03-26 and 2024-11-05 (`initialize`, `ping`, `tools/list`, `tools/call`).
 
+The same session is available on loopback HTTP: `effectcraft-cli mcp --http 127.0.0.1:8765`
+(`POST /mcp`, `GET /health`). Non-loopback addresses are refused. See [mcp.md](mcp.md).
+
 ### Keeping headless work across restarts
 
 Start `effectcraft-cli mcp --autosave` (MCP args `["mcp", "--autosave"]`) to preserve
@@ -119,7 +122,7 @@ See [MCP conventions](mcp.md) for core tools, resources, strict arguments, and r
 | `get_layer {layer, comp?, time?, depth?, flat?}` | A layer's property tree (`depth` limits how many group levels expand). Every node has a `path`. |
 | `get_property {layer, path, comp?, time?}` | A leaf property's value at a time, keyframes and expression. Group paths (for example `geometryOptions`) contain children: inspect them with `get_layer`, then query a leaf such as `geometryOptions/extrusionDepth`. |
 | `set_property {layer, path, value?, time?, timeBase?, expression?, comp?}` | Sets a static value. With `time` it sets a keyframe (`timeBase: "comp"` for comp seconds); with `expression` it sets an expression. |
-| `add_keyframe {layer, path, time+value \| keys:[...], timeBase?, interpolation?, comp?}` | Adds keys (layer seconds, or comp seconds with `timeBase: "comp"`), then optionally applies linear/bezier/hold/easyEase. |
+| `add_keyframe {layer, path, time+value \| keys:[...], timeBase?, interpolation?, inEase?, outEase?, comp?}` | Adds keys (layer seconds, or comp seconds with `timeBase: "comp"`), then optionally applies linear/bezier/hold/easyEase. `inEase` / `outEase` are `{speed, influence}` (influence is a percent) on the single key, or on each entry of `keys`. |
 | `list_effects {filter?}` | Effect ids, names, categories, GPU / 32-bpc support and parameters. |
 | `list_fonts {query?, variable?, rescan?}` | Font families text layers can use, bundled and installed, with their styles, origin, whether each is a variable font and own-language name; `variable` lists only variable fonts; `rescan` picks up fonts installed since launch. |
 | `add_effect {layer, effect, values?, comp?}` | Apply an effect and set its parameters in one call and one undo step (a failing value leaves nothing applied); returns the instance path (`effects/#n`) and its parameter paths. |

@@ -214,6 +214,47 @@ fn headless_workflow() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Per-key temporal ease: influence is a percent, speed is stored, and the curve is not linear.
+#[test]
+fn add_keyframe_applies_custom_ease() {
+    let mut s = server();
+    call_json(
+        &mut s,
+        "execute_command",
+        json!({"command": "comp.new", "params": {"name": "Ease", "width": 320, "height": 180, "duration": 2, "frameRate": 30}}),
+    );
+    let l =
+        call_json(&mut s, "execute_command", json!({"command": "layer.newSolid", "params": {"color": "#111111", "width": 40, "height": 40}}))["layer"].clone();
+    let p = call_json(
+        &mut s,
+        "add_keyframe",
+        json!({
+            "layer": l,
+            "path": "transform/scale",
+            "timeBase": "comp",
+            "keys": [
+                {"time": 0.0, "value": [0, 100], "outEase": {"speed": 0, "influence": 20}},
+                {"time": 1.0, "value": [100, 100], "inEase": {"speed": 0, "influence": 90}}
+            ]
+        }),
+    );
+    assert_eq!(p["keys"][0]["out"], "Bezier");
+    assert_eq!(p["keys"][1]["in"], "Bezier");
+    let uid = p["uid"].clone();
+    let info = call_json(&mut s, "execute_command", json!({"command": "keys.info", "params": {"keys": [{"layer": l, "prop": uid, "time": 0.0}]}}));
+    let row = info.as_array().and_then(|a| a.first()).unwrap_or_else(|| panic!("{info}"));
+    let out = &row["outEase"][0];
+    assert!((out["influence"].as_f64().unwrap() - 20.0).abs() < 0.5, "{row}");
+    assert!(out["speed"].as_f64().unwrap().abs() < 1e-6, "{row}");
+    let early = call_json(&mut s, "get_property", json!({"layer": l, "path": "transform/scale", "time": 0.25}));
+    let x = early["value"][0].as_f64().unwrap();
+    assert!(x > 40.0 && x < 95.0, "asymmetric ease should be ahead of linear at 0.25s, got {x}");
+
+    let (_, err) =
+        call(&mut s, "add_keyframe", json!({"layer": l, "path": "transform/opacity", "keys": [{"time": 0, "value": 10, "outEase": {"influence": "fast"}}]}));
+    assert!(err, "a non-numeric influence is rejected");
+}
+
 /// An expression with a syntax error is kept but disabled; set_property and get_property report
 /// its error, and `evaluated` is the static value that renders (#163).
 #[test]
@@ -1379,4 +1420,105 @@ fn automation_roots_confine_file_access() {
     // Writes to the files the agent named: none outside.
     assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1, "only the unconfined save");
     let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn http_loopback_round_trip() {
+    let err = crate::server::loopback_addr("0.0.0.0:9").unwrap_err();
+    assert!(err.to_string().contains("loopback"), "{err}");
+    let err = crate::server::loopback_addr("192.168.1.2:9").unwrap_err();
+    assert!(err.to_string().contains("loopback"), "{err}");
+    assert_eq!(crate::server::loopback_addr(":8765").unwrap().to_string(), "127.0.0.1:8765");
+    assert_eq!(crate::server::loopback_addr("localhost:9").unwrap().ip().to_string(), "127.0.0.1");
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let mut s = server();
+        s.serve_http_listener(listener).unwrap();
+    });
+
+    fn exchange(port: u16, method: &str, path: &str, body: &str, origin: Option<&str>) -> (u16, String) {
+        use std::io::{Read, Write};
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(30))).unwrap();
+        let origin = origin.map(|o| format!("Origin: {o}\r\n")).unwrap_or_default();
+        let req = format!(
+            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{origin}\r\n{body}",
+            body.len()
+        );
+        stream.write_all(req.as_bytes()).unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        let status = text.split_whitespace().nth(1).unwrap_or("0").parse().unwrap_or(0);
+        let body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+        (status, body)
+    }
+
+    let (status, body) = exchange(port, "GET", "/health", "", None);
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("\"ok\":true"), "{body}");
+
+    let (status, body) = exchange(
+        port,
+        "POST",
+        "/mcp",
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"http-test","version":"0"}}}"#,
+        None,
+    );
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(body.trim()).unwrap();
+    assert_eq!(v["result"]["serverInfo"]["name"], "effectcraft");
+    assert_eq!(v["result"]["protocolVersion"], "2025-06-18");
+
+    let (status, body) = exchange(port, "POST", "/mcp", r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#, Some("http://127.0.0.1"));
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(body.trim()).unwrap();
+    let names: Vec<&str> = v["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+    for want in ["execute_command", "add_keyframe", "add_effect", "render_frame", "render_preview", "get_state", "doc_inspect", "command_run"] {
+        assert!(names.contains(&want), "missing {want} in {names:?}");
+    }
+    assert!(names.len() >= 24, "expected many tools, got {}", names.len());
+
+    let (status, body) = exchange(
+        port,
+        "POST",
+        "/mcp",
+        r##"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"execute_command","arguments":{"command":"comp.new","params":{"name":"Http","width":64,"height":36,"duration":1,"background":"#101018"}}}}"##,
+        None,
+    );
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(body.trim()).unwrap();
+    assert_eq!(v["result"]["isError"], false, "{v}");
+    let created: Value = serde_json::from_str(v["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert!(created["comp"].as_u64().is_some(), "{created}");
+
+    let (status, body) = exchange(
+        port,
+        "POST",
+        "/mcp",
+        r##"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"execute_command","arguments":{"command":"layer.newSolid","params":{"name":"Plate","color":"#ff3366","width":32,"height":18}}}}"##,
+        None,
+    );
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(body.trim()).unwrap();
+    assert_eq!(v["result"]["isError"], false, "{v}");
+    let created: Value = serde_json::from_str(v["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert!(created["layer"].as_u64().is_some(), "{created}");
+
+    let (status, body) = exchange(port, "POST", "/mcp", "not-json", None);
+    assert_eq!(status, 400, "{body}");
+    let v: Value = serde_json::from_str(body.trim()).unwrap();
+    assert_eq!(v["error"]["code"], -32700);
+
+    let (status, body) = exchange(port, "POST", "/mcp", r#"{"jsonrpc":"2.0","id":5,"method":"ping"}"#, Some("https://evil.example"));
+    assert_eq!(status, 403, "{body}");
+
+    let (status, body) = exchange(port, "POST", "/nope", "{}", None);
+    assert_eq!(status, 404, "{body}");
+
+    let (status, _) = exchange(port, "POST", "/shutdown", "{}", None);
+    assert_eq!(status, 200);
+    server.join().unwrap();
 }
