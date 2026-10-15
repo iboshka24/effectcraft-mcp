@@ -344,12 +344,91 @@ fn set_property(b: &mut Backend, a: &Value) -> Result<Reply> {
     json_reply(b.exec("prop.get", obj(&[("layer", Some(layer)), ("path", Some(path)), ("comp", comp), ("time", time)]))?)
 }
 
+/// `{speed, influence}` for one side of a key. Influence is a percent, as in the Keyframe Velocity dialog.
+fn ease_fields(ease: &Value, side: &str) -> Result<(Option<f64>, Option<f64>)> {
+    let Some(o) = ease.as_object() else {
+        return Err(Error::BadArgs(format!("`{side}` must be {{\"speed\": number, \"influence\": percent}}")));
+    };
+    let num = |k: &str| -> Result<Option<f64>> {
+        match o.get(k) {
+            None => Ok(None),
+            Some(v) => v.as_f64().filter(|n| n.is_finite()).map(Some).ok_or_else(|| Error::BadArgs(format!("`{side}.{k}` must be a finite number"))),
+        }
+    };
+    let speed = num("speed")?;
+    let influence = num("influence")?;
+    if speed.is_none() && influence.is_none() {
+        return Err(Error::BadArgs(format!("`{side}` needs `speed` and/or `influence` (influence is a percent)")));
+    }
+    Ok((speed, influence))
+}
+
+fn select_added_keys(b: &mut Backend, a: &Value, keys: &[Value], info: &Value, comp: Option<&Value>) -> Result<()> {
+    if let Some(c) = comp {
+        b.exec("comp.open", json!({"comp": c}))?;
+    }
+    let sel: Vec<Value> = keys.iter().map(|k| json!({"layer": info["layer"], "prop": info["uid"], "time": k["time"]})).collect();
+    let mut select = json!({"keys": sel});
+    if let Some(tb) = get(a, "timeBase") {
+        select["timeBase"] = tb.clone();
+    }
+    b.exec("keys.select", select)?;
+    Ok(())
+}
+
+/// Per-key temporal ease, applied after a shared interpolation so a single key can depart from it.
+fn apply_key_eases(b: &mut Backend, a: &Value, keys: &[Value], info: &Value, comp: Option<&Value>) -> Result<()> {
+    for k in keys {
+        let inn = get(k, "inEase");
+        let out = get(k, "outEase");
+        if inn.is_none() && out.is_none() {
+            continue;
+        }
+        select_added_keys(b, a, std::slice::from_ref(k), info, comp)?;
+        let mut vel = json!({});
+        if let Some(e) = inn {
+            let (speed, influence) = ease_fields(e, "inEase")?;
+            if let Some(v) = speed {
+                vel["inSpeed"] = json!(v);
+            }
+            if let Some(v) = influence {
+                vel["inInfluence"] = json!(v);
+            }
+        }
+        if let Some(e) = out {
+            let (speed, influence) = ease_fields(e, "outEase")?;
+            if let Some(v) = speed {
+                vel["outSpeed"] = json!(v);
+            }
+            if let Some(v) = influence {
+                vel["outInfluence"] = json!(v);
+            }
+        }
+        b.exec("keys.velocity", vel)?;
+    }
+    Ok(())
+}
+
 fn add_keyframe(b: &mut Backend, a: &Value) -> Result<Reply> {
     let (layer, path, comp) = (need(a, "layer")?, need(a, "path")?, get(a, "comp"));
     let keys: Vec<Value> = match get(a, "keys") {
-        Some(Value::Array(k)) => k.clone(),
-        Some(_) => return Err(Error::BadArgs("`keys` must be an array of {time, value?}".into())),
-        None => vec![obj(&[("time", Some(need(a, "time")?)), ("value", get(a, "value"))])],
+        Some(Value::Array(k)) => {
+            if get(a, "inEase").is_some() || get(a, "outEase").is_some() {
+                return Err(Error::BadArgs("put `inEase` and `outEase` on each entry of `keys`".into()));
+            }
+            k.clone()
+        }
+        Some(_) => return Err(Error::BadArgs("`keys` must be an array of {time, value?, inEase?, outEase?}".into())),
+        None => {
+            let mut k = obj(&[("time", Some(need(a, "time")?)), ("value", get(a, "value"))]);
+            if let Some(e) = get(a, "inEase") {
+                k["inEase"] = e.clone();
+            }
+            if let Some(e) = get(a, "outEase") {
+                k["outEase"] = e.clone();
+            }
+            vec![k]
+        }
     };
     if keys.is_empty() {
         return Err(Error::BadArgs("no keys".into()));
@@ -367,17 +446,9 @@ fn add_keyframe(b: &mut Backend, a: &Value) -> Result<Reply> {
         b.exec("prop.addKey", p)?;
     }
     let info = b.exec("prop.get", obj(&base))?;
+    let mut shaped = false;
     if let Some(interp) = get(a, "interpolation").and_then(Value::as_str) {
-        // Key selection works on the active comp.
-        if let Some(c) = comp {
-            b.exec("comp.open", json!({"comp": c}))?;
-        }
-        let sel: Vec<Value> = keys.iter().map(|k| json!({"layer": info["layer"], "prop": info["uid"], "time": k["time"]})).collect();
-        let mut select = json!({"keys": sel});
-        if let Some(tb) = get(a, "timeBase") {
-            select["timeBase"] = tb.clone();
-        }
-        b.exec("keys.select", select)?;
+        select_added_keys(b, a, &keys, &info, comp)?;
         match interp.to_ascii_lowercase().as_str() {
             "easyease" | "ease" => b.exec("keys.easyEase", json!({}))?,
             "easyeasein" => b.exec("keys.easyEase", json!({"which": "in"}))?,
@@ -385,6 +456,13 @@ fn add_keyframe(b: &mut Backend, a: &Value) -> Result<Reply> {
             i @ ("linear" | "bezier" | "hold") => b.exec("keys.interpolation", json!({"interpolation": i}))?,
             other => return Err(Error::BadArgs(format!("unknown interpolation `{other}` (linear, bezier, hold, easyEase, easyEaseIn, easyEaseOut)"))),
         };
+        shaped = true;
+    }
+    if keys.iter().any(|k| get(k, "inEase").is_some() || get(k, "outEase").is_some()) {
+        apply_key_eases(b, a, &keys, &info, comp)?;
+        shaped = true;
+    }
+    if shaped {
         return json_reply(b.exec("prop.get", obj(&base))?);
     }
     json_reply(info)
@@ -661,16 +739,28 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "add_keyframe",
-        description: "Add keyframes to a property (turns the stopwatch on): one with `time` (+ optional `value`, default the current value) or many with `keys: [{time, value}]`, then optionally set their `interpolation`: linear, bezier, hold, easyEase, easyEaseIn, easyEaseOut. Example: {\"layer\":1,\"path\":\"transform/position\",\"keys\":[{\"time\":0,\"value\":[0,540]},{\"time\":2,\"value\":[1920,540]}],\"interpolation\":\"easyEase\"}.",
+        description: "Add keyframes to a property (turns the stopwatch on): one with `time` (+ optional `value`, default the current value) or many with `keys: [{time, value, inEase, outEase}]`, then optionally set their `interpolation`: linear, bezier, hold, easyEase, easyEaseIn, easyEaseOut. Per-key `inEase` / `outEase` are {speed, influence}; influence is a percent (0.1–100) and is applied after the shared interpolation, so one key can overshoot or settle on its own curve. Example: {\"layer\":1,\"path\":\"transform/scale\",\"keys\":[{\"time\":0,\"value\":[0,100],\"outEase\":{\"speed\":0,\"influence\":30}},{\"time\":0.4,\"value\":[112,100],\"inEase\":{\"speed\":0,\"influence\":60},\"outEase\":{\"speed\":0,\"influence\":40}},{\"time\":0.7,\"value\":[100,100],\"inEase\":{\"speed\":0,\"influence\":80}}]}.",
         bridge_only: false,
         schema: || {
+            let ease = |desc: &str| {
+                json!({
+                    "type": "object",
+                    "description": desc,
+                    "properties": {
+                        "speed": {"type": "number", "description": "Temporal speed at this side. 0 settles or leaves flat."},
+                        "influence": {"type": "number", "description": "Handle length as a percent of the neighbouring span (Keyframe Velocity)."}
+                    }
+                })
+            };
             schema(
                 json!({
                     "layer": layer_s(), "path": path_s(), "comp": comp_s(),
                     "time": {"type": "number", "description": "Key time in seconds (layer time)."},
                     "timeBase": {"type": "string", "enum": ["layer", "comp"], "description": "What `time` counts: layer time (the default) or comp time, as the Timeline shows it."},
                     "value": value_s(),
-                    "keys": {"type": "array", "items": {"type": "object", "properties": {"time": {"type": "number"}, "value": value_s()}, "required": ["time"]}, "description": "Several keys at once."},
+                    "inEase": ease("Incoming ease for the single-key form. With `keys`, put this on each key instead."),
+                    "outEase": ease("Outgoing ease for the single-key form. With `keys`, put this on each key instead."),
+                    "keys": {"type": "array", "items": {"type": "object", "properties": {"time": {"type": "number"}, "value": value_s(), "inEase": ease("Incoming ease for this key."), "outEase": ease("Outgoing ease for this key.")}, "required": ["time"]}, "description": "Several keys at once."},
                     "interpolation": {"type": "string", "enum": ["linear", "bezier", "hold", "easyEase", "easyEaseIn", "easyEaseOut"]}
                 }),
                 &["layer", "path"],

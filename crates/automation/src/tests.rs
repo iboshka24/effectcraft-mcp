@@ -214,6 +214,47 @@ fn headless_workflow() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Per-key temporal ease: influence is a percent, speed is stored, and the curve is not linear.
+#[test]
+fn add_keyframe_applies_custom_ease() {
+    let mut s = server();
+    call_json(
+        &mut s,
+        "execute_command",
+        json!({"command": "comp.new", "params": {"name": "Ease", "width": 320, "height": 180, "duration": 2, "frameRate": 30}}),
+    );
+    let l =
+        call_json(&mut s, "execute_command", json!({"command": "layer.newSolid", "params": {"color": "#111111", "width": 40, "height": 40}}))["layer"].clone();
+    let p = call_json(
+        &mut s,
+        "add_keyframe",
+        json!({
+            "layer": l,
+            "path": "transform/scale",
+            "timeBase": "comp",
+            "keys": [
+                {"time": 0.0, "value": [0, 100], "outEase": {"speed": 0, "influence": 20}},
+                {"time": 1.0, "value": [100, 100], "inEase": {"speed": 0, "influence": 90}}
+            ]
+        }),
+    );
+    assert_eq!(p["keys"][0]["out"], "Bezier");
+    assert_eq!(p["keys"][1]["in"], "Bezier");
+    let uid = p["uid"].clone();
+    let info = call_json(&mut s, "execute_command", json!({"command": "keys.info", "params": {"keys": [{"layer": l, "prop": uid, "time": 0.0}]}}));
+    let row = info.as_array().and_then(|a| a.first()).unwrap_or_else(|| panic!("{info}"));
+    let out = &row["outEase"][0];
+    assert!((out["influence"].as_f64().unwrap() - 20.0).abs() < 0.5, "{row}");
+    assert!(out["speed"].as_f64().unwrap().abs() < 1e-6, "{row}");
+    let early = call_json(&mut s, "get_property", json!({"layer": l, "path": "transform/scale", "time": 0.25}));
+    let x = early["value"][0].as_f64().unwrap();
+    assert!(x > 40.0 && x < 95.0, "asymmetric ease should be ahead of linear at 0.25s, got {x}");
+
+    let (_, err) =
+        call(&mut s, "add_keyframe", json!({"layer": l, "path": "transform/opacity", "keys": [{"time": 0, "value": 10, "outEase": {"influence": "fast"}}]}));
+    assert!(err, "a non-numeric influence is rejected");
+}
+
 /// An expression with a syntax error is kept but disabled; set_property and get_property report
 /// its error, and `evaluated` is the static value that renders (#163).
 #[test]

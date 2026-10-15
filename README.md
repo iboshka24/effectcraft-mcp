@@ -2,20 +2,16 @@
 
 An AI-controllable fork of [storytold/effectcraft](https://github.com/storytold/effectcraft) — an open-source After Effects-style compositor written in pure Rust. This repository keeps the upstream engine, licenses, and attribution, and drives it with a Model Context Protocol server: stdio for desktop clients, and loopback HTTP for local agents.
 
-The Aurora demo below was built entirely by calling those tools (compositions, solids, text, shapes, footage, nulls, an adjustment layer, eased keyframes, glow, masks, blend modes, a precomp, and a render queue).
+![Index, a 12-second editorial title](examples/index/index.gif)
 
-![Aurora, the title resolved](examples/aurora/frames/aurora-03.png)
+**Index** is a 1920×1080, 30 fps, 12-second title built only through the MCP tools: flat paper `#F3F0E8`, ink `#141414`, and one red mark. No gradients, glows, or blurs.
 
 | | |
 |---|---|
-| Project | [`examples/aurora/aurora.ecproj`](examples/aurora/aurora.ecproj) |
-| Film | [`examples/aurora/aurora.mp4`](examples/aurora/aurora.mp4) |
-| Loop | [`examples/aurora/aurora.gif`](examples/aurora/aurora.gif) |
-| Builder | [`examples/aurora/build_aurora.py`](examples/aurora/build_aurora.py) |
-
-![Aurora opening](examples/aurora/frames/aurora-01.png)
-![Aurora mid-move](examples/aurora/frames/aurora-02.png)
-![Aurora settle](examples/aurora/frames/aurora-04.png)
+| Film | [`examples/index/index.mp4`](examples/index/index.mp4) |
+| Project | [`examples/index/index.ecproj`](examples/index/index.ecproj) |
+| Stills | [`examples/index/frames/`](examples/index/frames/) |
+| Builder | [`examples/index/build_index.py`](examples/index/build_index.py) |
 
 ## Setup
 
@@ -45,7 +41,7 @@ Stdio is the transport Cursor, Claude Code, and Claude Desktop expect. From this
 }
 ```
 
-[`/.mcp.json`](.mcp.json) registers that server, plus `effectcraft-demo`, which opens the Aurora project. Add `--demo` to boot the upstream sample project, or `--project path/to/file.ecproj` to open a file. `--autosave` checkpoints a dirty headless project before each tool reply.
+[`/.mcp.json`](.mcp.json) registers that server, plus `effectcraft-demo`, which opens the Index project. Add `--demo` to boot the upstream sample project, or `--project path/to/file.ecproj` to open a file. `--autosave` checkpoints a dirty headless project before each tool reply.
 
 Loopback HTTP speaks the same JSON-RPC messages, one request at a time. It binds only `127.0.0.1` or `localhost`; any other address is rejected.
 
@@ -91,7 +87,7 @@ Bridge mode adds `screenshot` and the `ui_*` tools.
 | `get_layer` | A layer's property tree. Every leaf has a `path`. `flat: true` returns a compact list. |
 | `get_property` | One property at a comp time: value, keyframes, interpolation, expression. |
 | `set_property` | Static value, a keyframe (`time`), or an expression. `timeBase` is `layer` or `comp`. |
-| `add_keyframe` | One key or `keys: [{time, value}]`, then `interpolation`: `linear`, `bezier`, `hold`, `easyEase`, `easyEaseIn`, `easyEaseOut`. |
+| `add_keyframe` | One key or `keys: [{time, value, inEase, outEase}]`. `interpolation`: `linear`, `bezier`, `hold`, `easyEase`, `easyEaseIn`, `easyEaseOut`. `inEase` / `outEase` are `{speed, influence}` with influence in percent, applied after the shared interpolation. |
 | `list_effects` | Effect registry: id, name, category, GPU and 32-bpc flags, parameters. |
 | `add_effect` | Apply an effect and set parameters in one undo step. Returns `effects/#n` and each parameter path. |
 | `list_fonts` | Families the text engine can use (bundled and installed), with styles. |
@@ -121,7 +117,7 @@ Bridge mode adds `screenshot` and the `ui_*` tools.
 | Composition | `comp.new`, `comp.settings`, `comp.open`, `comp.workArea`, `comp.setPosterTime` |
 | Layers | `layer.newSolid`, `layer.newText`, `layer.newShape`, `layer.newNull`, `layer.newAdjustment`, `layer.addItem` (image, video, precomp) |
 | Transform & timing | `prop.set`, `prop.addKey`, `keys.set`, `layer.timing`, `layer.setParent` |
-| Keyframe easing | `add_keyframe` with `easyEase` / `easyEaseIn` / `easyEaseOut` / `bezier` / `hold` / `linear` |
+| Keyframe easing | `add_keyframe` with `inEase` / `outEase` (`speed`, `influence` percent), or `easyEase` / `easyEaseIn` / `easyEaseOut` / `bezier` / `hold` / `linear`. Motion blur: `comp.new` `shutterAngle`, `comp.setSwitch`, `layer.setSwitch`. |
 | Effects | `effect.apply`, `effect.list`, `add_effect`, then `set_property` on `effects/#n/…` |
 | Masks | `layer.addMask`, `mask.new`, `layer.setMask`, `mask.setVertex` |
 | Blending | `layer.setBlendMode` (`Screen`, `Add`, `Multiply`, …), `layer.setTrackMatte` |
@@ -135,31 +131,30 @@ Shapes accept `kind`: `rect`, `rounded`, `ellipse`, `star`, `polygon`. Text acce
 ### A short session
 
 ```json
-{"name":"execute_command","arguments":{"command":"comp.new","params":{"name":"Intro","width":1920,"height":1080,"frameRate":30,"duration":4,"background":"#07060f"}}}
-{"name":"execute_command","arguments":{"command":"layer.newText","params":{"text":"Hello","name":"Title","size":140,"fill":"#ffffff"}}}
-{"name":"add_keyframe","arguments":{"layer":"Title","path":"transform/position","keys":[{"time":0,"value":[200,540]},{"time":1.4,"value":[960,540]}],"interpolation":"easyEase"}}
-{"name":"add_effect","arguments":{"layer":"Title","effect":"Glow","values":{"threshold":40,"radius":24,"intensity":1.2}}}
+{"name":"execute_command","arguments":{"command":"comp.new","params":{"name":"Intro","width":1920,"height":1080,"frameRate":30,"duration":4,"background":"#F3F0E8"}}}
+{"name":"execute_command","arguments":{"command":"layer.newText","params":{"text":"INDEX","name":"Title","font":"Inter","style":"Bold","size":200,"fill":"#141414","justify":"left","position":[96,540]}}}
+{"name":"add_keyframe","arguments":{"layer":"Title","path":"transform/opacity","keys":[{"time":0,"value":0,"outEase":{"speed":0,"influence":40}},{"time":0.6,"value":100,"inEase":{"speed":0,"influence":80}}],"timeBase":"comp"}}
 {"name":"render_frame","arguments":{"time":1.0,"max_side":960}}
 {"name":"save_project","arguments":{"path":"intro.ecproj"}}
 ```
 
 Times on `add_keyframe` and `set_property` are layer seconds unless `timeBase` is `"comp"`. `render_frame` and `get_property` take comp seconds.
 
-## Aurora demo
+## Index demo
 
-960×540, 24 fps, 4 seconds. The builder (`examples/aurora/build_aurora.py`) starts `effectcraft-cli mcp --empty` and then:
+1920×1080, 30 fps, 12 seconds. The builder (`examples/index/build_index.py`) starts `effectcraft-cli mcp --empty` and then:
 
-1. Creates the **Aurora** composition and reads `get_state`, `command_list`, `list_effects`, and `list_fonts`.
-2. Paints a solid with **4-Color Gradient**, imports a still and a short video, and lays them in with Screen / Add blending and an ellipse mask.
-3. Builds three blurred ellipse orbs, parents them to a null, and precomps that rig as **Aurora Field**.
-4. Animates a stroked ring, a star, and a rule with easy-ease scale, position, rotation, and opacity.
-5. Sets **AURORA** with a per-character animator and Glow, then **MOTION, COMPOSED**.
-6. Grades the frame with an adjustment layer, seeks to the poster frame, saves the `.ecproj`, writes four PNG frames, and renders H.264 and GIF through the render queue.
+1. Creates **Index** on an 8px grid: shutter 120°, eight motion-blur samples, paper background.
+2. Sets Inter Bold headlines and Inter Medium labels. **STRUCTURE** rises per character (`layer.addTextAnimator`). **TYPE** hard-cuts on the same origin.
+3. Wipes **WEIGHT / MEASURE / INTERVAL** with track mattes, and draws the rules with custom bezier scale.
+4. Slides a flat black field in from the red mark's right edge. **MOTION** is paper type, matted to that field, so the edge is one match cut.
+5. The field leaves and uncovers **EFFECT / CRAFT**. The mark travels on a straight path, holds still between moves, and lands with a short scale overshoot.
+6. Saves the project, writes eight PNG frames, and renders H.264 through the queue with an 18 Mbps VBR target and motion blur on the moving layers. Flat fields encode well below that cap. The GIF in this README is a 1280-wide, 15 fps palette pass of that master (`dither=none`, so the fields stay clean).
 
-Rebuild after a debug or release build:
+`--frames` is the default (project and stills only). `--render` also writes the master and the GIF.
 
 ```sh
-EFFECTCRAFT_CLI=target/release/effectcraft-cli python3 examples/aurora/build_aurora.py
+EFFECTCRAFT_CLI=target/release/effectcraft-cli python3 examples/index/build_index.py --render
 ```
 
 ## Tests
@@ -177,13 +172,13 @@ cargo test -p effectcraft-automation --lib
 - Сервер: `effectcraft-cli mcp` (stdio) или `effectcraft-cli mcp --http 127.0.0.1:8765` (только loopback).
 - Сборка: Rust 1.95+, `cargo build --release -p effectcraft-cli`.
 - 36 инструментов: проект, слои (solid, text, shape, image, video, null, adjustment), трансформы, ключи с ease, эффекты, маски, режимы наложения, прекомпы, время, рендер, захват кадра и чтение состояния.
-- Демо «Aurora»: `examples/aurora/aurora.ecproj`, `aurora.mp4`, `aurora.gif`, кадры в `examples/aurora/frames/`.
+- Демо «Index»: `examples/index/index.ecproj`, `index.mp4`, `index.gif` (превью в начале README), кадры в `examples/index/frames/`. 1920×1080, 30 к/с, 12 с. Плоские бумага, тушь и один красный знак.
 
 Авторские права на движок остаются у ArtCraft Team и участников EffectCraft. См. `LICENSE-APACHE`, `LICENSE-MIT`, `NOTICE`, `ATTRIBUTION.md`.
 
 ## License and credits
 
-EffectCraft is licensed under the MIT License or the Apache License 2.0, at your option. This fork redistributes that work unchanged except for the MCP HTTP transport, the Aurora demo, and these docs.
+EffectCraft is licensed under the MIT License or the Apache License 2.0, at your option. This fork redistributes that work unchanged except for the MCP HTTP transport, per-key ease on `add_keyframe`, the Index demo, and these docs.
 
 - Upstream: [github.com/storytold/effectcraft](https://github.com/storytold/effectcraft)
 - Copyright: ArtCraft Team and the EffectCraft contributors (`NOTICE`)
@@ -195,5 +190,5 @@ EffectCraft is licensed under the MIT License or the Apache License 2.0, at your
 - The HTTP transport is loopback-only and serves one request at a time. Render progress and cancellation are implemented on stdio.
 - Headless rendering uses the CPU unless the process is started with `--gpu`.
 - `screenshot` and the `ui_*` tools need a desktop app started with `--control`.
-- The Aurora film is a 4-second 960×540 piece. Full-HD timelines with large blurs are slower on CPU.
+- Index is a 12-second 1080p30 film. Motion blur is limited to the mark, the rules, the mattes, and the field; type stays sharp. A full-frame blur on every layer would be much slower on CPU.
 - This fork imports a snapshot of upstream. It is not an automatically updated mirror.

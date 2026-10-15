@@ -6,7 +6,7 @@
     },
     "effectcraft-demo": {
       "command": "target/release/effectcraft-cli",
-      "args": ["mcp", "--project", "examples/aurora/aurora.ecproj"]
+      "args": ["mcp", "--project", "examples/index/index.ecproj"]
     }
   }
 }
